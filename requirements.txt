@@ -1,0 +1,10 @@
+python-telegram-bot
+google-generativeai
+azure-ai-documentintelligence
+pypdf
+pandas
+Pillow
+python-dotenv
+openpyxl
+PyMuPDF
+aiohttp

@@ -1,0 +1,12 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Environment
+.env
+
+# Project Specific
+pdf/
+bmad/
+temp_bot_files/
