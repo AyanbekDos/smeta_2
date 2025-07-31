@@ -144,12 +144,13 @@ def flatten_json_to_dataframe(data: dict) -> pd.DataFrame:
     for profile, p_data in data.get("профили", {}).items():
         for steel, s_data in p_data.get("марки_стали", {}).items():
             for size, z_data in s_data.get("размеры", {}).items():
-                for element, e_data in z_data.get("элементы", {}).items():
+                # Изменено: теперь перебираем список, а не словарь, чтобы избежать агрегации
+                for e_data in z_data.get("элементы", []):
                     flat_list.append({
                         "Наименование профиля": profile,
                         "Марка стали": steel,
                         "Размер профиля": size,
-                        "Тип элемента": element,
+                        "Тип элемента": e_data.get("тип"), # Данные из словаря в списке
                         "Позиции": ", ".join(map(str, e_data.get("позиции", []))),
                         f"Масса, {unit}": e_data.get("масса"),
                     })
@@ -197,17 +198,34 @@ async def process_specification(update: Update, context: ContextTypes.DEFAULT_TY
         if not result.tables:
             await chat.send_message("Не удалось найти таблицу на указанной странице.")
             return
-        raw_html_table = table_to_html(result.tables[0])
-        logger.info(f"[USER_ID: {user_id}] - Azure OCR successful. Raw HTML generated.")
+
+        # --- Объединяем ВСЕ найденные таблицы в один HTML для Gemini ---
+        all_tables_html_parts = [table_to_html(table) for table in result.tables]
+        full_html_content = "\n<hr>\n".join(all_tables_html_parts) # Соединяем таблицы линией
+        logger.info(f"[USER_ID: {user_id}] - Combined HTML from {len(result.tables)} tables generated for Gemini.")
+
+        # --- ОТЛАДКА: Сохраняем этот же HTML в файл ---
+        debug_file_path = os.path.join(TEMP_DIR, f"azure_output_{user_id}.html")
+        with open(debug_file_path, "w", encoding="utf-8") as f:
+            f.write(full_html_content)
+        logger.info(f"[USER_ID: {user_id}] - Azure OCR debug HTML saved to {debug_file_path}")
+        # --- КОНЕЦ ОТЛАДКИ ---
 
         # Этап 3: Единая коррекция и извлечение JSON
         logger.info(f"[USER_ID: {user_id}] - STEP 3: Correcting and extracting JSON with Gemini...")
         prompt = get_prompt("extract_and_correct.txt")
         model = genai.GenerativeModel(model_name=GEMINI_MODEL_NAME)
-        response = await model.generate_content_async([prompt, raw_html_table], generation_config=GenerationConfig(response_mime_type="application/json"))
+        response = await model.generate_content_async([prompt, full_html_content], generation_config=GenerationConfig(response_mime_type="application/json"))
         
         json_data = json.loads(response.text)
         logger.info(f"[USER_ID: {user_id}] - JSON extracted successfully.")
+
+        # --- ОТЛАДКА: Сохраняем JSON структурированную версию ---
+        json_file_path = os.path.join(TEMP_DIR, f"structured_output_{user_id}.json")
+        with open(json_file_path, "w", encoding="utf-8") as f:
+            json.dump(json_data, f, ensure_ascii=False, indent=2)
+        logger.info(f"[USER_ID: {user_id}] - JSON structured data saved to {json_file_path}")
+        # --- КОНЕЦ ОТЛАДКИ JSON ---
 
         # Этап 4: Генерация отчетов
         df = flatten_json_to_dataframe(json_data)
