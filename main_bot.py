@@ -4,11 +4,13 @@ import io
 import json
 import base64
 import tempfile
+import re
 import fitz  # PyMuPDF
 import pandas as pd
 import google.generativeai as genai
 import asyncio
 import httpx
+import telegram
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
@@ -45,7 +47,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Константы
-(SELECTING_ACTION, AWAITING_CONFIRMATION, AWAITING_MANUAL_PAGE) = range(3)
+(SELECTING_ACTION, AWAITING_CONFIRMATION, AWAITING_MANUAL_PAGE, AWAITING_URL) = range(4)
 TEMP_DIR = "temp_bot_files"
 MAX_RETRIES = 3
 
@@ -175,6 +177,73 @@ async def run_gemini_with_retry(model, prompt, gemini_file, user_id):
                 raise e
     raise last_exception
 
+def convert_file_sharing_url(url: str) -> str:
+    """
+    Конвертирует ссылки популярных файлообменников в прямые ссылки для скачивания.
+    """
+    # Google Drive
+    if "drive.google.com" in url:
+        # Извлекаем ID файла из ссылки
+        match = re.search(r'/d/([a-zA-Z0-9-_]+)', url)
+        if match:
+            file_id = match.group(1)
+            return f"https://drive.google.com/uc?export=download&id={file_id}"
+    
+    # Яндекс.Диск
+    elif "disk.yandex" in url:
+        # Для Яндекс.Диска нужен специальный API-запрос
+        return url  # Обрабатываем отдельно
+    
+    # Dropbox
+    elif "dropbox.com" in url:
+        # Заменяем dl=0 на dl=1 для прямого скачивания
+        return url.replace("dl=0", "dl=1").replace("?dl=0", "?dl=1")
+    
+    # WeTransfer и другие
+    return url
+
+async def download_file_from_url(url: str, user_id: int) -> bytes:
+    """
+    Скачивает файл по ссылке с поддержкой различных файлообменников.
+    """
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    
+    # Конвертируем ссылку если необходимо
+    download_url = convert_file_sharing_url(url)
+    
+    async with httpx.AsyncClient(timeout=300.0, follow_redirects=True) as client:
+        # Сначала проверяем размер файла
+        try:
+            head_response = await client.head(download_url, headers=headers)
+            content_length = head_response.headers.get('content-length')
+            if content_length and int(content_length) > 50 * 1024 * 1024:  # 50 MB лимит
+                raise ValueError(f"Файл слишком большой ({int(content_length) / 1024 / 1024:.1f} МБ). Максимум 50 МБ.")
+        except Exception:
+            # Если не удалось проверить размер, продолжаем
+            pass
+        
+        # Скачиваем файл
+        response = await client.get(download_url, headers=headers)
+        response.raise_for_status()
+        
+        # Проверяем размер после скачивания
+        if len(response.content) > 50 * 1024 * 1024:
+            raise ValueError(f"Файл слишком большой ({len(response.content) / 1024 / 1024:.1f} МБ). Максимум 50 МБ.")
+        
+        return response.content
+
+def is_valid_file_url(text: str) -> bool:
+    """
+    Проверяет, является ли текст валидной ссылкой на Dropbox.
+    """
+    url_pattern = r'https?://[^\s]+'
+    if not re.match(url_pattern, text):
+        return False
+    
+    return 'dropbox.com' in text.lower()
+
 # --- Основная логика --- 
 
 async def process_specification(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -246,7 +315,14 @@ async def process_specification(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data.clear()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Загрузите PDF-файл для обработки.")
+    welcome_message = """👋 Добро пожаловать!
+
+📎 **Загрузите PDF-файл** (до 20 МБ) или 
+🔗 **Отправьте ссылку с Dropbox**
+
+💡 Dropbox: https://dropbox.com"""
+    
+    await update.message.reply_text(welcome_message)
     return SELECTING_ACTION
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -257,11 +333,26 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Проверка размера файла ПЕРЕД скачиванием ---
     if update.message.document.file_size > 20 * 1024 * 1024: # 20 MB limit
-        logger.warning(f"[USER_ID: {user_id}] - PDF rejected: file too large ({update.message.document.file_size / 1024 / 1024:.2f} MB).")
-        await update.message.reply_text(
-            "Ошибка: Файл слишком большой. Пожалуйста, загрузите файл размером не более 20 МБ."
-        )
-        return ConversationHandler.END
+        file_size_mb = update.message.document.file_size / 1024 / 1024
+        logger.warning(f"[USER_ID: {user_id}] - PDF rejected: file too large ({file_size_mb:.2f} MB).")
+        
+        # Красивое сообщение с предложением альтернативы
+        message = f"""📁 Файл слишком большой ({file_size_mb:.1f} МБ)
+
+🚫 Telegram позволяет отправлять файлы до 20 МБ
+✅ Но мы можем помочь!
+
+🔗 **Загрузите файл на Dropbox:**
+👉 https://dropbox.com
+
+📤 **Затем отправьте мне ссылку** и я обработаю ваш документ
+
+💡 **Совет:** Убедитесь, что ссылка открыта для общего доступа
+
+👇 **Отправьте ссылку с Dropbox прямо сейчас:**"""
+
+        await update.message.reply_text(message)
+        return AWAITING_URL
 
     file_id = update.message.document.file_id
     file_name = update.message.document.file_name
@@ -343,14 +434,40 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["found_page_number"] = page_number
         pdf_document = fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf")
         page = pdf_document.load_page(page_number - 1)
-        img_buffer = io.BytesIO(page.get_pixmap(dpi=200).tobytes("png"))
+        
+        # Создаем изображение с правильными размерами для Telegram
+        pix = page.get_pixmap(dpi=200)
+        
+        # Проверяем размеры и корректируем если необходимо
+        if pix.width < 10 or pix.height < 10:
+            # Если размеры слишком маленькие, увеличиваем DPI
+            pix = page.get_pixmap(dpi=300)
+        elif pix.width > 10000 or pix.height > 10000:
+            # Если размеры слишком большие, уменьшаем DPI
+            pix = page.get_pixmap(dpi=150)
+        
+        img_buffer = io.BytesIO(pix.tobytes("png"))
+        pdf_document.close()
 
         keyboard = [[InlineKeyboardButton("✅ Да", callback_data="yes"), InlineKeyboardButton("❌ Нет", callback_data="no")]]
-        await update.message.reply_photo(
-            photo=img_buffer,
-            caption=f"Это верная таблица (страница {page_number})?",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+        
+        try:
+            await update.message.reply_photo(
+                photo=img_buffer,
+                caption=f"Это верная таблица (страница {page_number})?",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        except telegram.error.BadRequest as e:
+            if "Photo_invalid_dimensions" in str(e):
+                # Если не удалось отправить изображение, отправляем текстовое сообщение
+                logger.warning(f"[USER_ID: {user_id}] - Failed to send photo, sending text message instead: {e}")
+                await update.message.reply_text(
+                    f"Найдена страница {page_number}. Это верная таблица?",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            else:
+                raise e
+                
         return AWAITING_CONFIRMATION
 
     except Exception as e:
@@ -364,12 +481,31 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_confirmation_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    
     if query.data == "yes":
-        await query.edit_message_caption(caption="Отлично! Начинаю обработку...")
+        # Пробуем отредактировать caption, если не получается - отправляем новое сообщение
+        try:
+            await query.edit_message_caption(caption="Отлично! Начинаю обработку...")
+        except telegram.error.BadRequest as e:
+            if "There is no caption in the message to edit" in str(e):
+                logger.info(f"No caption to edit, using edit_message_text instead: {e}")
+                await query.edit_message_text(text="Отлично! Начинаю обработку...")
+            else:
+                raise e
+        
         await process_specification(update, context)
         return ConversationHandler.END
     else:
-        await query.edit_message_caption(caption="Введите правильный номер страницы:")
+        # Пробуем отредактировать caption, если не получается - отправляем новое сообщение
+        try:
+            await query.edit_message_caption(caption="Введите правильный номер страницы:")
+        except telegram.error.BadRequest as e:
+            if "There is no caption in the message to edit" in str(e):
+                logger.info(f"No caption to edit, using edit_message_text instead: {e}")
+                await query.edit_message_text(text="Введите правильный номер страницы:")
+            else:
+                raise e
+        
         return AWAITING_MANUAL_PAGE
 
 async def handle_manual_page_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -382,6 +518,134 @@ async def handle_manual_page_input(update: Update, context: ContextTypes.DEFAULT
     except (ValueError):
         await update.message.reply_text("Введите корректный номер страницы.")
         return AWAITING_MANUAL_PAGE
+
+async def handle_file_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает ссылку на файл с файлообменника.
+    """
+    user_id = update.effective_user.id
+    url = update.message.text.strip()
+    
+    # Проверяем валидность ссылки
+    if not is_valid_file_url(url):
+        supported_services = """❌ Поддерживается только Dropbox
+
+🔗 Загрузите файл на Dropbox:
+👉 https://dropbox.com
+
+💡 Убедитесь, что ссылка открыта для общего доступа"""
+        await update.message.reply_text(supported_services)
+        return AWAITING_URL
+    
+    await update.message.reply_text("🔄 Скачиваю файл по ссылке...")
+    
+    try:
+        # Скачиваем файл
+        pdf_bytes = await download_file_from_url(url, user_id)
+        logger.info(f"[USER_ID: {user_id}] - File downloaded from URL: {len(pdf_bytes)} bytes")
+        
+        # Проверяем, что это PDF
+        try:
+            pdf_document = fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf")
+            num_pages = len(pdf_document)
+            pdf_document.close()
+        except Exception:
+            await update.message.reply_text("❌ Файл не является корректным PDF-документом.")
+            return AWAITING_URL
+        
+        # Проверяем количество страниц
+        if num_pages > 100:
+            await update.message.reply_text(f"❌ Документ слишком большой ({num_pages} страниц). Максимум 100 страниц.")
+            return AWAITING_URL
+        
+        # Сохраняем данные и продолжаем обработку
+        context.user_data["pdf_bytes"] = pdf_bytes
+        await update.message.reply_text(f"✅ Файл успешно загружен! Документ содержит {num_pages} страниц. Начинаю анализ...")
+        
+        # Продолжаем обработку как обычно
+        temp_pdf_path = None
+        try:
+            os.makedirs(TEMP_DIR, exist_ok=True)
+            temp_pdf_path = os.path.join(TEMP_DIR, f"{user_id}_check.pdf")
+            with open(temp_pdf_path, "wb") as f:
+                f.write(pdf_bytes)
+
+            logger.info(f"[USER_ID: {user_id}] - STEP 1: Performing validation and page search with Gemini.")
+            gemini_file = genai.upload_file(path=temp_pdf_path)
+            prompt = get_prompt("find_and_validate.txt")
+            model = genai.GenerativeModel(model_name=GEMINI_MODEL_NAME)
+            
+            response = await run_gemini_with_retry(model, prompt, gemini_file, user_id)
+            genai.delete_file(gemini_file.name)
+
+            try:
+                cleaned_text = response.text.replace("```json", "").replace("```", "").strip()
+                result = json.loads(cleaned_text)
+            except (json.JSONDecodeError, AttributeError, ValueError) as e:
+                logger.error(f"[USER_ID: {user_id}] - Failed to decode Gemini response: {e}", exc_info=True)
+                await update.message.reply_text("Не удалось распознать ответ от сервиса анализа. Попробуйте другой файл.")
+                return ConversationHandler.END
+
+            page_number = result.get("page", 0)
+            if page_number == 0:
+                await update.message.reply_text("Не удалось найти страницу. Введите номер вручную.")
+                return AWAITING_MANUAL_PAGE
+
+            context.user_data["found_page_number"] = page_number
+            pdf_document = fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf")
+            page = pdf_document.load_page(page_number - 1)
+            
+            # Создаем изображение с правильными размерами для Telegram
+            pix = page.get_pixmap(dpi=200)
+            
+            # Проверяем размеры и корректируем если необходимо
+            if pix.width < 10 or pix.height < 10:
+                # Если размеры слишком маленькие, увеличиваем DPI
+                pix = page.get_pixmap(dpi=300)
+            elif pix.width > 10000 or pix.height > 10000:
+                # Если размеры слишком большие, уменьшаем DPI
+                pix = page.get_pixmap(dpi=150)
+            
+            img_buffer = io.BytesIO(pix.tobytes("png"))
+            pdf_document.close()
+
+            keyboard = [[InlineKeyboardButton("✅ Да", callback_data="yes"), InlineKeyboardButton("❌ Нет", callback_data="no")]]
+            
+            try:
+                await update.message.reply_photo(
+                    photo=img_buffer,
+                    caption=f"Это верная таблица (страница {page_number})?",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+            except telegram.error.BadRequest as e:
+                if "Photo_invalid_dimensions" in str(e):
+                    # Если не удалось отправить изображение, отправляем текстовое сообщение
+                    logger.warning(f"[USER_ID: {user_id}] - Failed to send photo, sending text message instead: {e}")
+                    await update.message.reply_text(
+                        f"Найдена страница {page_number}. Это верная таблица?",
+                        reply_markup=InlineKeyboardMarkup(keyboard)
+                    )
+                else:
+                    raise e
+                    
+            return AWAITING_CONFIRMATION
+
+        except Exception as e:
+            logger.error(f"[USER_ID: {user_id}] - Error in handle_file_url: {e}", exc_info=True)
+            await update.message.reply_text("Ошибка при анализе документа.")
+            return ConversationHandler.END
+        finally:
+            if temp_pdf_path and os.path.exists(temp_pdf_path):
+                os.remove(temp_pdf_path)
+        
+    except ValueError as e:
+        # Ошибки размера файла
+        await update.message.reply_text(f"❌ {str(e)}")
+        return AWAITING_URL
+    except Exception as e:
+        logger.error(f"[USER_ID: {user_id}] - Error downloading file from URL: {e}", exc_info=True)
+        await update.message.reply_text("❌ Не удалось скачать файл. Проверьте ссылку и убедитесь, что файл доступен для скачивания.")
+        return AWAITING_URL
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Действие отменено.")
@@ -397,9 +661,13 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            SELECTING_ACTION: [MessageHandler(filters.Document.PDF, handle_document)],
+            SELECTING_ACTION: [
+                MessageHandler(filters.Document.PDF, handle_document),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_file_url)
+            ],
             AWAITING_CONFIRMATION: [CallbackQueryHandler(handle_confirmation_choice)],
             AWAITING_MANUAL_PAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_page_input)],
+            AWAITING_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_file_url)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )

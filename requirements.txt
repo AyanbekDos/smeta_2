@@ -8,3 +8,4 @@ python-dotenv
 openpyxl
 PyMuPDF
 aiohttp
+httpx

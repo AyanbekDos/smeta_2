@@ -1,0 +1,49 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: telegram-pdf-bot
+  annotations:
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/execution-environment: gen2
+        run.googleapis.com/cpu-throttling: "false"
+    spec:
+      containerConcurrency: 1000
+      timeoutSeconds: 3600
+      containers:
+      - image: gcr.io/PROJECT_ID/telegram-pdf-bot
+        ports:
+        - containerPort: 8080
+        env:
+        - name: TELEGRAM_BOT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: telegram-bot-secrets
+              key: bot-token
+        - name: GEMINI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: telegram-bot-secrets
+              key: gemini-key
+        - name: AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: telegram-bot-secrets
+              key: azure-endpoint
+        - name: AZURE_DOCUMENT_INTELLIGENCE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: telegram-bot-secrets
+              key: azure-key
+        - name: GEMINI_MODEL_NAME
+          value: "gemini-1.5-pro-latest"
+        resources:
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+          requests:
+            cpu: 1000m
+            memory: 2Gi

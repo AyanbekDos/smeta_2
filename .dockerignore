@@ -1,0 +1,34 @@
+# Игнорируем архивные файлы
+archive_files/
+
+# Игнорируем Git файлы
+.git/
+.gitignore
+
+# Игнорируем переменные окружения
+.env
+
+# Игнорируем Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Игнорируем IDE файлы
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Игнорируем Docker файлы
+.dockerignore
+Dockerfile
+
+# Игнорируем временные файлы
+temp_bot_files/
+*.tmp
+*.log
+
+# Игнорируем документацию разработки
+README.md
