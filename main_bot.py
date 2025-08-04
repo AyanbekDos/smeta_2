@@ -982,8 +982,15 @@ telegram_app.add_handler(conv_handler)
 # Инициализируем бота для webhook режима
 try:
     import asyncio
-    asyncio.run(telegram_app.initialize())
-    logger.info("Telegram Application initialized.")
+    # Создаем постоянный event loop для всего приложения
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Инициализируем синхронно
+    loop.run_until_complete(telegram_app.initialize())
+    loop.run_until_complete(telegram_app.start())
+    
+    logger.info("Telegram Application initialized with persistent event loop.")
 except Exception as e:
     logger.error(f"Failed to initialize Telegram App: {e}", exc_info=True)
     raise e
@@ -997,8 +1004,14 @@ def webhook():
     try:
         update = Update.de_json(request.get_json(force=True), telegram_app.bot)
         
-        # Запускаем асинхронную обработку в новом цикле событий
-        asyncio.run(telegram_app.process_update(update))
+        # Используем существующий event loop вместо создания нового
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Если loop уже запущен, используем create_task
+            asyncio.create_task(telegram_app.process_update(update))
+        else:
+            # Если loop не запущен, используем run_until_complete
+            loop.run_until_complete(telegram_app.process_update(update))
         
         return "OK", 200
     except Exception as e:
