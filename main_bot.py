@@ -173,16 +173,25 @@ def flatten_json_to_dataframe(data: dict) -> pd.DataFrame:
     return pd.DataFrame(flat_list)
 
 async def run_gemini_with_retry(model, prompt, content, user_id, generation_config=None):
-    """Запускает Gemini с retry логикой. content может быть файлом или текстом"""
+    """Запускает Gemini с retry логикой и таймаутом. content может быть файлом или текстом"""
     retries = 0
     last_exception = None
+    request_options = {"timeout": 180}  # Таймаут 3 минуты
+
     while retries < MAX_RETRIES:
         try:
             logger.info(f"[USER_ID: {user_id}] - Gemini API call attempt {retries + 1}")
             if generation_config:
-                response = await model.generate_content_async([prompt, content], generation_config=generation_config)
+                response = await model.generate_content_async(
+                    [prompt, content], 
+                    generation_config=generation_config, 
+                    request_options=request_options
+                )
             else:
-                response = await model.generate_content_async([prompt, content])
+                response = await model.generate_content_async(
+                    [prompt, content], 
+                    request_options=request_options
+                )
             return response
         except Exception as e:
             last_exception = e
@@ -519,11 +528,9 @@ async def process_specification(update: Update, context: ContextTypes.DEFAULT_TY
         pdf_bytes = context.user_data["pdf_bytes"]
         page_number = context.user_data.get("manual_page_number") or context.user_data.get("found_page_number")
 
-        # Этап 2: Извлечение страницы в PNG и распознавание с Azure
-        logger.info(f"[USER_ID: {user_id}] - STEP 2: Extracting page {page_number} to PNG and sending to Azure...")
+        await chat.send_message("🔍 Распознаю текст на странице...")
         pdf_document = fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf")
         
-        # Проверяем, что страница существует
         if page_number > len(pdf_document):
             pdf_document.close()
             await chat.send_message(f"Ошибка: страница {page_number} не существует. Документ содержит только {len(pdf_document)} страниц.")
@@ -531,24 +538,19 @@ async def process_specification(update: Update, context: ContextTypes.DEFAULT_TY
         
         page_to_ocr = pdf_document.load_page(page_number - 1)
         
-        # Начинаем с DPI 300, но уменьшаем если файл слишком большой
         dpi = 300
-        max_file_size = 4 * 1024 * 1024  # 4MB лимит для Azure
+        max_file_size = 4 * 1024 * 1024
         
         while dpi >= 150:
             pix = page_to_ocr.get_pixmap(dpi=dpi)
             png_bytes = pix.tobytes("png")
-            
             if len(png_bytes) <= max_file_size:
-                logger.info(f"[USER_ID: {user_id}] - Using DPI {dpi}, image size: {len(png_bytes) / 1024 / 1024:.1f}MB")
                 break
-            else:
-                logger.warning(f"[USER_ID: {user_id}] - DPI {dpi} too large ({len(png_bytes) / 1024 / 1024:.1f}MB), reducing...")
-                dpi -= 50
+            dpi -= 50
         
         if len(png_bytes) > max_file_size:
             pdf_document.close()
-            await chat.send_message("Ошибка: страница слишком большая для обработки. Попробуйте с другим документом.")
+            await chat.send_message("Ошибка: страница слишком большая для обработки.")
             return
             
         pdf_document.close()
@@ -560,20 +562,10 @@ async def process_specification(update: Update, context: ContextTypes.DEFAULT_TY
             await chat.send_message("Не удалось найти таблицу на указанной странице.")
             return
 
-        # --- Объединяем ВСЕ найденные таблицы в один HTML для Gemini ---
         all_tables_html_parts = [table_to_html(table) for table in result.tables]
-        full_html_content = "\n<hr>\n".join(all_tables_html_parts) # Соединяем таблицы линией
-        logger.info(f"[USER_ID: {user_id}] - Combined HTML from {len(result.tables)} tables generated for Gemini.")
+        full_html_content = "\n<hr>\n".join(all_tables_html_parts)
 
-        # --- ОТЛАДКА: Сохраняем этот же HTML в файл ---
-        debug_file_path = os.path.join(TEMP_DIR, f"azure_output_{user_id}.html")
-        with open(debug_file_path, "w", encoding="utf-8") as f:
-            f.write(full_html_content)
-        logger.info(f"[USER_ID: {user_id}] - Azure OCR debug HTML saved to {debug_file_path}")
-        # --- КОНЕЦ ОТЛАДКИ ---
-
-        # Этап 3: Единая коррекция и извлечение JSON
-        logger.info(f"[USER_ID: {user_id}] - STEP 3: Correcting and extracting JSON with Gemini...")
+        await chat.send_message("🤖 Анализирую структуру таблицы... Это может занять до 3 минут.")
         prompt = get_prompt("extract_and_correct.txt")
         model = genai.GenerativeModel(model_name=GEMINI_MODEL_NAME)
         response = await run_gemini_with_retry(
@@ -585,51 +577,35 @@ async def process_specification(update: Update, context: ContextTypes.DEFAULT_TY
         )
         
         json_data = json.loads(response.text)
-        logger.info(f"[USER_ID: {user_id}] - JSON extracted successfully.")
 
-        # --- ОТЛАДКА: Сохраняем JSON структурированную версию ---
-        json_file_path = os.path.join(TEMP_DIR, f"structured_output_{user_id}.json")
-        with open(json_file_path, "w", encoding="utf-8") as f:
-            json.dump(json_data, f, ensure_ascii=False, indent=2)
-        logger.info(f"[USER_ID: {user_id}] - JSON structured data saved to {json_file_path}")
-        # --- КОНЕЦ ОТЛАДКИ JSON ---
-
-        # Этап 4: Генерация отчетов
+        await chat.send_message("📊 Создаю отчеты...")
         df = flatten_json_to_dataframe(json_data)
         txt_buffer = io.BytesIO(df.to_string(index=False).encode('utf-8'))
         xlsx_buffer = io.BytesIO()
         df.to_excel(xlsx_buffer, index=False, engine='openpyxl')
         xlsx_buffer.seek(0)
 
-        # Этап 5: Сохранение в Google Cloud Storage для файнтюнинга
         pdf_file_name = context.user_data.get("pdf_file_name", "unknown")
-        logger.info(f"[USER_ID: {user_id}] - STEP 5: Saving to GCS for fine-tuning...")
-        
-        # Получаем промпты из файлов
         find_prompt = get_prompt("find_and_validate.txt")
         extract_prompt = get_prompt("extract_and_correct.txt")
         
-        # Создаем высококачественную версию для архивирования (DPI 300)
         pdf_document = fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf")
         page_for_archive = pdf_document.load_page(page_number - 1)
-        archive_pix = page_for_archive.get_pixmap(dpi=300)  # Всегда высокое качество для архива
+        archive_pix = page_for_archive.get_pixmap(dpi=300)
         archive_png_bytes = archive_pix.tobytes("png")
         pdf_document.close()
         
-        logger.info(f"[USER_ID: {user_id}] - Archive image: {len(archive_png_bytes) / 1024 / 1024:.1f}MB at 300 DPI")
-        
-        # Сохраняем данные в GCS с высококачественным изображением
         await save_to_gcs(
             user_id=user_id,
             pdf_name=pdf_file_name,
-            page_image_bytes=archive_png_bytes,  # Используем архивную версию!
+            page_image_bytes=archive_png_bytes,
             ocr_html=full_html_content,
             corrected_json=json_data,
             find_prompt=find_prompt,
             extract_prompt=extract_prompt
         )
 
-        await chat.send_message("Ваша спецификация обработана:")
+        await chat.send_message("✅ Готово! Ваша спецификация обработана:")
         await chat.send_document(document=InputFile(xlsx_buffer, filename="specification.xlsx"))
         await chat.send_document(document=InputFile(txt_buffer, filename="specification.txt"))
         logger.info(f"[USER_ID: {user_id}] - FINAL: Reports sent.")
@@ -730,7 +706,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не удалось проверить количество страниц в PDF. Файл может быть поврежден.")
         return ConversationHandler.END
 
-    await update.message.reply_text("Файл принят. Провожу первичный анализ...")
+    await update.message.reply_text("✅ Файл принят. Ищу страницу со спецификацией...")
 
     temp_pdf_path = None
     try:
@@ -896,7 +872,7 @@ async def handle_file_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Сохраняем данные и продолжаем обработку
         context.user_data["pdf_bytes"] = pdf_bytes
-        await update.message.reply_text(f"✅ Файл успешно загружен! Документ содержит {num_pages} страниц. Начинаю анализ...")
+        await update.message.reply_text(f"✅ Файл успешно загружен! Ищу страницу со спецификацией...")
         
         # Продолжаем обработку как обычно
         temp_pdf_path = None
