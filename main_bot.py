@@ -33,10 +33,9 @@ from azure.ai.documentintelligence.aio import DocumentIntelligenceClient
 from azure.ai.documentintelligence.models import AnalyzeResult, DocumentTable
 from google.generativeai.types import GenerationConfig
 from google.cloud import storage
+from aiohttp import web
 
-# Для веб-сервера (Cloud Run)
-from flask import Flask, request
-import threading
+
 
 # --- Конфигурация ---
 load_dotenv()
@@ -979,15 +978,15 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
-def main():
+async def main():
     if not all([TELEGRAM_BOT_TOKEN, AZURE_ENDPOINT, AZURE_KEY, GEMINI_API_KEY]):
         logger.critical("FATAL: One or more environment variables are missing!")
         return
-    
+
     if not GCS_BUCKET:
         logger.warning("GCS_BUCKET not configured - archiving will be disabled")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    ptb_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -1000,57 +999,62 @@ def main():
             AWAITING_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_file_url)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False  # Важно для правильной работы в вебхук-режиме
     )
-    app.add_handler(conv_handler)
-    
-    # Определяем режим работы
+    ptb_app.add_handler(conv_handler)
+
     cloud_run_mode = os.getenv("CLOUD_RUN", "false").lower() == "true"
-    port = int(os.getenv("PORT", 8080))
-    
-    if cloud_run_mode:
-        logger.info("--- BOT INITIALIZED. STARTING WEBHOOK MODE FOR CLOUD RUN... ---")
-        
-        # Создаем Flask приложение для webhook
-        flask_app = Flask(__name__)
-        
-        @flask_app.route('/webhook', methods=['POST'])
-        def webhook():
-            """Обработчик webhook от Telegram"""
-            try:
-                json_data = request.get_json()
-                update = Update.de_json(json_data, app.bot)
-                # Обрабатываем update напрямую без очереди
-                asyncio.create_task(app.process_update(update))
-                return "OK", 200
-            except Exception as e:
-                logger.error(f"Webhook error: {e}")
-                return "Error", 500
-        
-        @flask_app.route('/health', methods=['GET'])
-        def health():
-            """Health check для Cloud Run"""
-            return "OK", 200
-        
-        @flask_app.route('/', methods=['GET'])
-        def root():
-            """Root endpoint"""
-            return "SmetaI Telegram Bot is running!", 200
-        
-        # Инициализируем бота без polling
-        async def initialize_bot():
-            await app.initialize()
-            await app.start()
-        
-        # Запускаем инициализацию бота
-        asyncio.create_task(initialize_bot())
-        
-        # Запускаем только Flask сервер
-        logger.info(f"Starting Flask server on port {port}")
-        flask_app.run(host='0.0.0.0', port=port, debug=False)
-        
-    else:
+
+    if not cloud_run_mode:
         logger.info("--- BOT INITIALIZED. STARTING POLLING MODE... ---")
-        app.run_polling()
+        await ptb_app.run_polling()
+        return
+
+    # --- Режим Webhook для Cloud Run ---
+    logger.info("--- BOT INITIALIZED. STARTING WEBHOOK MODE FOR CLOUD RUN... ---")
+    port = int(os.getenv("PORT", 8080))
+    webhook_url = os.getenv("WEBHOOK_URL")
+
+    if not webhook_url:
+        logger.critical("FATAL: WEBHOOK_URL is not set in Cloud Run mode!")
+        return
+
+    # Инициализируем приложение PTB, но не запускаем его
+    await ptb_app.initialize()
+
+    # Устанавливаем вебхук
+    full_webhook_url = f"{webhook_url.rstrip('/')}/{TELEGRAM_BOT_TOKEN}"
+    await ptb_app.bot.set_webhook(url=full_webhook_url, allowed_updates=Update.ALL_TYPES)
+    logger.info(f"Webhook set to {full_webhook_url}")
+
+    # --- Настройка веб-сервера AIOHTTP ---
+    async def telegram_webhook(request):
+        try:
+            update = Update.de_json(await request.json(), ptb_app.bot)
+            await ptb_app.process_update(update)
+            return web.Response()
+        except Exception as e:
+            logger.error(f"Error processing update: {e}", exc_info=True)
+            return web.Response(status=500)
+
+    async def health_check(_):
+        return web.Response(text="OK")
+
+    # Создаем и запускаем веб-сервер
+    aio_app = web.Application()
+    aio_app.add_routes([
+        web.post(f"/{TELEGRAM_BOT_TOKEN}", telegram_webhook),
+        web.get("/health", health_check),
+    ])
+
+    runner = web.AppRunner(aio_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Webhook server started on port {port}")
+
+    # Бесконечно ждем, пока Cloud Run не остановит контейнер
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
