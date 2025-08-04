@@ -410,15 +410,15 @@ async def save_to_gcs(
         # 3. Сохраняем corrected.json
         json_data = json.dumps(corrected_json, ensure_ascii=False, indent=2)
         blob = bucket.blob(f"{base_path}/corrected.json")
-        blob.upload_from_string(json_data, content_type='application/json')
+        blob.upload_from_string(json_data, content_type='application/json; charset=utf-8')
         
         # 4. Сохраняем find_prompt.txt (промпт для поиска таблиц)
         blob = bucket.blob(f"{base_path}/find_prompt.txt")
-        blob.upload_from_string(find_prompt, content_type='text/plain')
+        blob.upload_from_string(find_prompt, content_type='text/plain; charset=utf-8')
         
         # 5. Сохраняем extract_prompt.txt (промпт для извлечения данных)
         blob = bucket.blob(f"{base_path}/extract_prompt.txt")
-        blob.upload_from_string(extract_prompt, content_type='text/plain')
+        blob.upload_from_string(extract_prompt, content_type='text/plain; charset=utf-8')
         
         # 6. Сохраняем meta.json
         meta_data = {
