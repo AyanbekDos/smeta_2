@@ -38,10 +38,48 @@ from google.cloud import storage
 from flask import Flask, request
 import threading
 
-
-
 # --- Конфигурация ---
 load_dotenv()
+
+# Глобальные переменные для Cloud Run
+flask_app = Flask(__name__)
+telegram_app = None
+
+# Flask маршруты для Cloud Run
+@flask_app.route('/webhook', methods=['POST'])
+def webhook():
+    """Обработчик webhook от Telegram"""
+    global telegram_app
+    if not telegram_app:
+        return "Bot not initialized", 500
+        
+    try:
+        json_data = request.get_json()
+        update = Update.de_json(json_data, telegram_app.bot)
+        
+        # Создаем новый event loop для обработки
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(telegram_app.process_update(update))
+        finally:
+            loop.close()
+            
+        return "OK", 200
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return "Error", 500
+
+@flask_app.route('/health', methods=['GET'])
+def health():
+    """Health check для Cloud Run"""
+    return "OK", 200
+
+@flask_app.route('/', methods=['GET'])
+def root():
+    """Root endpoint"""
+    return "SmetaI Telegram Bot is running!", 200
 
 # API Ключи
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -958,14 +996,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-def main():
-    """
-    Главная функция, настраивает обработчики и запускает бота
-    """
+def setup_telegram_app():
+    """Настраивает и возвращает Telegram приложение"""
     genai.configure(api_key=GEMINI_API_KEY)
-
+    
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
+    
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -980,55 +1016,40 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(conv_handler)
+    return app
+
+def main():
+    """Главная функция"""
+    global telegram_app
     
     # Определяем режим работы
     cloud_run_mode = os.getenv("CLOUD_RUN", "false").lower() == "true"
-    port = int(os.getenv("PORT", 8080))
     
     if cloud_run_mode:
-        logger.info("--- BOT INITIALIZED. STARTING WEBHOOK MODE FOR CLOUD RUN... ---")
+        # Для Cloud Run - инициализируем бота синхронно
+        logger.info("--- BOT INITIALIZED. CLOUD RUN MODE ---")
+        telegram_app = setup_telegram_app()
         
-        # Создаем Flask приложение для webhook
-        flask_app = Flask(__name__)
-        
-        @flask_app.route('/webhook', methods=['POST'])
-        def webhook():
-            """Обработчик webhook от Telegram"""
-            try:
-                json_data = request.get_json()
-                update = Update.de_json(json_data, app.bot)
-                # Обрабатываем update напрямую без очереди
-                asyncio.create_task(app.process_update(update))
-                return "OK", 200
-            except Exception as e:
-                logger.error(f"Webhook error: {e}")
-                return "Error", 500
-        
-        @flask_app.route('/health', methods=['GET'])
-        def health():
-            """Health check для Cloud Run"""
-            return "OK", 200
-        
-        @flask_app.route('/', methods=['GET'])
-        def root():
-            """Root endpoint"""
-            return "SmetaI Telegram Bot is running!", 200
-        
-        # Инициализируем бота без polling
-        async def initialize_bot():
-            await app.initialize()
-            await app.start()
-        
-        # Запускаем инициализацию бота
-        asyncio.create_task(initialize_bot())
-        
-        # Запускаем только Flask сервер
-        logger.info(f"Starting Flask server on port {port}")
-        flask_app.run(host='0.0.0.0', port=port, debug=False)
+        # Инициализируем бота синхронно для gunicorn
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(telegram_app.initialize())
+            loop.run_until_complete(telegram_app.start())
+            logger.info("Telegram bot initialized for Cloud Run")
+        finally:
+            # Не закрываем loop, он нужен для обработки webhook
+            pass
+            
+        # gunicorn будет запускать flask_app автоматически
+        return flask_app
         
     else:
+        # Локальный режим - polling
         logger.info("--- BOT INITIALIZED. STARTING POLLING MODE... ---")
-        app.run_polling()
+        telegram_app = setup_telegram_app()
+        telegram_app.run_polling()
 
 if __name__ == "__main__":
     main()

@@ -13,3 +13,4 @@ google-cloud-storage
 pyarrow
 fastparquet
 flask
+gunicorn

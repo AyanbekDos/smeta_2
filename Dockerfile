@@ -1,47 +1,33 @@
-# Многоэтапная сборка для оптимизации
-FROM python:3.11-slim as builder
-
-# Устанавливаем системные зависимости
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
-
-# Копируем requirements и устанавливаем зависимости
-COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
-
-# Финальный образ
+# Используем официальный Python runtime как базовый образ
 FROM python:3.11-slim
 
-# Устанавливаем только рантайм зависимости
+# Устанавливаем рабочую директорию
+WORKDIR /app
+
+# Устанавливаем системные зависимости, необходимые для библиотек
+# libgl1-mesa-glx и libglib2.0-0 часто требуются для GUI-библиотек типа PyMuPDF/Pillow
 RUN apt-get update && apt-get install -y \
     libgl1-mesa-glx \
     libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+    && rm -rf /var/lib/apt/lists/*
 
-# Копируем установленные Python пакеты из builder
-COPY --from=builder /root/.local /root/.local
+# Копируем файл с зависимостями
+COPY requirements.txt .
 
-# Рабочая директория
-WORKDIR /app
+# Устанавливаем Python-зависимости
+# --no-cache-dir для уменьшения размера слоя
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем только нужные файлы приложения
-COPY main_bot.py .
-COPY extract_and_correct.txt .
-COPY find_and_validate.txt .
+# Копируем все файлы приложения в рабочую директорию
+COPY . .
 
-# Создаем директории
-RUN mkdir -p temp_bot_files
-
-# Переменные окружения
+# Указываем порт, который будет слушать Cloud Run
 ENV PORT=8080
-ENV PYTHONPATH=/app
-ENV PATH=/root/.local/bin:$PATH
+# Устанавливаем флаг для запуска в режиме веб-сервера
 ENV CLOUD_RUN=true
 
-# Запуск
-CMD ["python", "main_bot.py"]
+# Создаем директорию для временных файлов
+RUN mkdir -p temp_bot_files
+
+# Запускаем через gunicorn для продакшна
+CMD exec gunicorn --bind 0.0.0.0:$PORT --workers 1 --timeout 3600 main_bot:flask_app
