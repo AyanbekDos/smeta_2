@@ -70,3 +70,6 @@ Thumbs.db
 specification*.txt
 specification*.xlsx
 archive_files/
+
+# Google Cloud SDK
+GCS/

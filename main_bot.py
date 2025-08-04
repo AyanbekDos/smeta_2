@@ -34,6 +34,10 @@ from azure.ai.documentintelligence.models import AnalyzeResult, DocumentTable
 from google.generativeai.types import GenerationConfig
 from google.cloud import storage
 
+# Для веб-сервера (Cloud Run)
+from flask import Flask, request
+import threading
+
 # --- Конфигурация ---
 load_dotenv()
 
@@ -998,8 +1002,53 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(conv_handler)
-    logger.info("--- BOT INITIALIZED. STARTING POLLING... ---")
-    app.run_polling()
+    
+    # Определяем режим работы
+    cloud_run_mode = os.getenv("CLOUD_RUN", "false").lower() == "true"
+    port = int(os.getenv("PORT", 8080))
+    
+    if cloud_run_mode:
+        logger.info("--- BOT INITIALIZED. STARTING WEBHOOK MODE FOR CLOUD RUN... ---")
+        
+        # Создаем Flask приложение для webhook
+        flask_app = Flask(__name__)
+        
+        @flask_app.route('/webhook', methods=['POST'])
+        def webhook():
+            """Обработчик webhook от Telegram"""
+            try:
+                json_data = request.get_json()
+                update = Update.de_json(json_data, app.bot)
+                asyncio.create_task(app.update_queue.put(update))
+                return "OK", 200
+            except Exception as e:
+                logger.error(f"Webhook error: {e}")
+                return "Error", 500
+        
+        @flask_app.route('/health', methods=['GET'])
+        def health():
+            """Health check для Cloud Run"""
+            return "OK", 200
+        
+        @flask_app.route('/', methods=['GET'])
+        def root():
+            """Root endpoint"""
+            return "SmetaI Telegram Bot is running!", 200
+        
+        # Запускаем Flask в отдельном потоке
+        def run_flask():
+            flask_app.run(host='0.0.0.0', port=port, debug=False)
+        
+        flask_thread = threading.Thread(target=run_flask)
+        flask_thread.daemon = True
+        flask_thread.start()
+        
+        # Запускаем обработку updates
+        app.run_polling(drop_pending_updates=True)
+        
+    else:
+        logger.info("--- BOT INITIALIZED. STARTING POLLING MODE... ---")
+        app.run_polling()
 
 if __name__ == "__main__":
     main()

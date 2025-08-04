@@ -114,6 +114,7 @@ gcloud run deploy telegram-pdf-bot \
   --set-env-vars "AZURE_DOCUMENT_INTELLIGENCE_KEY=ВАШ_КЛЮЧ_AZURE" \
   --set-env-vars "GCS_BUCKET=$BUCKET_NAME" \
   --set-env-vars "PROMPT_VERSION=v1.0" \
+  --set-env-vars "CLOUD_RUN=true" \
   --memory 2Gi \
   --cpu 1 \
   --timeout 3600 \
@@ -151,7 +152,7 @@ echo "Service URL: $SERVICE_URL"
 # Установите webhook для Telegram бота (замените TOKEN на ваш токен)
 curl -X POST "https://api.telegram.org/botВАШ_ТОКЕН/setWebhook" \
   -H "Content-Type: application/json" \
-  -d "{\"url\": \"$SERVICE_URL/telegram-webhook\"}"
+  -d "{\"url\": \"$SERVICE_URL/webhook\"}"
 ```
 
 ## 🔧 Важные настройки
