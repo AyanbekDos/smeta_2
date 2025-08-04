@@ -1019,7 +1019,8 @@ def main():
             try:
                 json_data = request.get_json()
                 update = Update.de_json(json_data, app.bot)
-                asyncio.create_task(app.update_queue.put(update))
+                # Обрабатываем update напрямую без очереди
+                asyncio.create_task(app.process_update(update))
                 return "OK", 200
             except Exception as e:
                 logger.error(f"Webhook error: {e}")
@@ -1035,16 +1036,17 @@ def main():
             """Root endpoint"""
             return "SmetaI Telegram Bot is running!", 200
         
-        # Запускаем Flask в отдельном потоке
-        def run_flask():
-            flask_app.run(host='0.0.0.0', port=port, debug=False)
+        # Инициализируем бота без polling
+        async def initialize_bot():
+            await app.initialize()
+            await app.start()
         
-        flask_thread = threading.Thread(target=run_flask)
-        flask_thread.daemon = True
-        flask_thread.start()
+        # Запускаем инициализацию бота
+        asyncio.create_task(initialize_bot())
         
-        # Запускаем обработку updates
-        app.run_polling(drop_pending_updates=True)
+        # Запускаем только Flask сервер
+        logger.info(f"Starting Flask server on port {port}")
+        flask_app.run(host='0.0.0.0', port=port, debug=False)
         
     else:
         logger.info("--- BOT INITIALIZED. STARTING POLLING MODE... ---")
