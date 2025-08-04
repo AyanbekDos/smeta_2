@@ -978,15 +978,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
-async def main():
-    if not all([TELEGRAM_BOT_TOKEN, AZURE_ENDPOINT, AZURE_KEY, GEMINI_API_KEY]):
-        logger.critical("FATAL: One or more environment variables are missing!")
-        return
-
-    if not GCS_BUCKET:
-        logger.warning("GCS_BUCKET not configured - archiving will be disabled")
-
-    ptb_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+def setup_bot() -> Application:
+    """Создает и настраивает экземпляр PTB Application."""
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -999,35 +993,26 @@ async def main():
             AWAITING_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_file_url)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False  # Важно для правильной работы в вебхук-режиме
+        per_message=False
     )
-    ptb_app.add_handler(conv_handler)
+    application.add_handler(conv_handler)
+    return application
 
-    cloud_run_mode = os.getenv("CLOUD_RUN", "false").lower() == "true"
-
-    if not cloud_run_mode:
-        logger.info("--- BOT INITIALIZED. STARTING POLLING MODE... ---")
-        await ptb_app.run_polling()
-        return
-
-    # --- Режим Webhook для Cloud Run ---
-    logger.info("--- BOT INITIALIZED. STARTING WEBHOOK MODE FOR CLOUD RUN... ---")
+async def main_webhook():
+    """Запускает бота в режиме вебхука для Cloud Run."""
+    ptb_app = setup_bot()
     port = int(os.getenv("PORT", 8080))
     webhook_url = os.getenv("WEBHOOK_URL")
 
     if not webhook_url:
-        logger.critical("FATAL: WEBHOOK_URL is not set in Cloud Run mode!")
+        logger.critical("FATAL: WEBHOOK_URL is not set!")
         return
 
-    # Инициализируем приложение PTB, но не запускаем его
     await ptb_app.initialize()
-
-    # Устанавливаем вебхук
     full_webhook_url = f"{webhook_url.rstrip('/')}/{TELEGRAM_BOT_TOKEN}"
     await ptb_app.bot.set_webhook(url=full_webhook_url, allowed_updates=Update.ALL_TYPES)
     logger.info(f"Webhook set to {full_webhook_url}")
 
-    # --- Настройка веб-сервера AIOHTTP ---
     async def telegram_webhook(request):
         try:
             update = Update.de_json(await request.json(), ptb_app.bot)
@@ -1040,7 +1025,6 @@ async def main():
     async def health_check(_):
         return web.Response(text="OK")
 
-    # Создаем и запускаем веб-сервер
     aio_app = web.Application()
     aio_app.add_routes([
         web.post(f"/{TELEGRAM_BOT_TOKEN}", telegram_webhook),
@@ -1052,9 +1036,20 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logger.info(f"Webhook server started on port {port}")
-
-    # Бесконечно ждем, пока Cloud Run не остановит контейнер
     await asyncio.Event().wait()
 
+def main_polling():
+    """Запускает бота в режиме long polling для локальной разработки."""
+    logger.info("--- Starting bot in polling mode... ---")
+    ptb_app = setup_bot()
+    ptb_app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    if not all([TELEGRAM_BOT_TOKEN, AZURE_ENDPOINT, AZURE_KEY, GEMINI_API_KEY]):
+        logger.critical("FATAL: One or more environment variables are missing!")
+    else:
+        cloud_run_mode = os.getenv("CLOUD_RUN", "false").lower() == "true"
+        if cloud_run_mode:
+            asyncio.run(main_webhook())
+        else:
+            main_polling()
