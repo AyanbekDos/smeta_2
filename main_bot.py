@@ -36,6 +36,7 @@ from google.cloud import storage
 
 # Для веб-сервера (Cloud Run)
 from flask import Flask, request
+import asyncio
 
 # --- Конфигурация ---
 load_dotenv()
@@ -991,11 +992,14 @@ except Exception as e:
 flask_app = Flask(__name__)
 
 @flask_app.route('/webhook', methods=['POST'])
-async def webhook():
-    """Асинхронный обработчик webhook от Telegram"""
+def webhook():
+    """Синхронный обработчик webhook от Telegram"""
     try:
         update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-        await telegram_app.update_queue.put(update)
+        
+        # Запускаем асинхронную обработку в новом цикле событий
+        asyncio.run(telegram_app.process_update(update))
+        
         return "OK", 200
     except Exception as e:
         logger.error(f"Webhook error: {e}", exc_info=True)

@@ -22,6 +22,6 @@ COPY . .
 # Создаем директорию для временных файлов
 RUN mkdir -p temp_bot_files
 
-# Запускаем приложение через gunicorn с uvicorn воркерами
-# Это стандартный способ для запуска ASGI-приложений в продакшене
-CMD ["gunicorn", "--bind", "0.0.0.0:$PORT", "--workers", "1", "--worker-class", "uvicorn.workers.UvicornWorker", "main_bot:flask_app"]
+# Запускаем Flask через gunicorn (WSGI)
+# Убираем uvicorn - он для ASGI, а Flask это WSGI
+CMD exec gunicorn --bind 0.0.0.0:$PORT --workers 1 --timeout 3600 main_bot:flask_app
