@@ -21,6 +21,18 @@
    gcloud config set project your-project-id
    ```
 
+## Создание GCS Bucket
+
+Создайте bucket для хранения данных:
+
+```bash
+# Создаем bucket для архивирования данных
+gsutil mb gs://your-dataset-bucket-name
+
+# Устанавливаем правильные права доступа
+gsutil iam ch serviceAccount:your-service-account@your-project.iam.gserviceaccount.com:objectCreator gs://your-dataset-bucket-name
+```
+
 ## Настройка секретов
 
 Создайте секреты в Google Secret Manager:
@@ -36,6 +48,9 @@ echo "YOUR_GEMINI_KEY" | gcloud secrets create gemini-api-key --data-file=-
 echo "YOUR_AZURE_ENDPOINT" | gcloud secrets create azure-endpoint --data-file=-
 echo "YOUR_AZURE_KEY" | gcloud secrets create azure-key --data-file=-
 
+# GCS Bucket name
+echo "your-dataset-bucket" | gcloud secrets create gcs-bucket --data-file=-
+
 # Создаем секрет со всеми ключами
 gcloud secrets create telegram-bot-secrets \
     --data-file=<(cat <<EOF
@@ -43,6 +58,7 @@ bot-token: $(gcloud secrets versions access latest --secret=telegram-bot-token)
 gemini-key: $(gcloud secrets versions access latest --secret=gemini-api-key)
 azure-endpoint: $(gcloud secrets versions access latest --secret=azure-endpoint)
 azure-key: $(gcloud secrets versions access latest --secret=azure-key)
+gcs-bucket: $(gcloud secrets versions access latest --secret=gcs-bucket)
 EOF
 )
 ```

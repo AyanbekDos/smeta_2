@@ -40,6 +40,13 @@ spec:
               key: azure-key
         - name: GEMINI_MODEL_NAME
           value: "gemini-1.5-pro-latest"
+        - name: GCS_BUCKET
+          valueFrom:
+            secretKeyRef:
+              name: telegram-bot-secrets
+              key: gcs-bucket
+        - name: PROMPT_VERSION
+          value: "v1.0"
         resources:
           limits:
             cpu: 2000m

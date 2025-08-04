@@ -9,3 +9,6 @@ openpyxl
 PyMuPDF
 aiohttp
 httpx
+google-cloud-storage
+pyarrow
+fastparquet

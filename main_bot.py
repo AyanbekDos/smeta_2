@@ -5,8 +5,14 @@ import json
 import base64
 import tempfile
 import re
+import gzip
+import uuid
+from datetime import datetime, timezone
+from PIL import Image
 import fitz  # PyMuPDF
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import google.generativeai as genai
 import asyncio
 import httpx
@@ -26,6 +32,7 @@ from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence.aio import DocumentIntelligenceClient
 from azure.ai.documentintelligence.models import AnalyzeResult, DocumentTable
 from google.generativeai.types import GenerationConfig
+from google.cloud import storage
 
 # --- Конфигурация ---
 load_dotenv()
@@ -36,6 +43,10 @@ GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-pro-latest") # П
 AZURE_ENDPOINT = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
 AZURE_KEY = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+# Google Cloud Storage
+GCS_BUCKET = os.getenv("GCS_BUCKET")
+PROMPT_VERSION = os.getenv("PROMPT_VERSION", "v1.0")
 
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -158,23 +169,40 @@ def flatten_json_to_dataframe(data: dict) -> pd.DataFrame:
                     })
     return pd.DataFrame(flat_list)
 
-async def run_gemini_with_retry(model, prompt, gemini_file, user_id):
+async def run_gemini_with_retry(model, prompt, content, user_id, generation_config=None):
+    """Запускает Gemini с retry логикой. content может быть файлом или текстом"""
     retries = 0
     last_exception = None
     while retries < MAX_RETRIES:
         try:
             logger.info(f"[USER_ID: {user_id}] - Gemini API call attempt {retries + 1}")
-            response = await model.generate_content_async([prompt, gemini_file])
+            if generation_config:
+                response = await model.generate_content_async([prompt, content], generation_config=generation_config)
+            else:
+                response = await model.generate_content_async([prompt, content])
             return response
         except Exception as e:
             last_exception = e
-            if "500" in str(e) or "internal error" in str(e).lower():
+            # Расширенная проверка на временные ошибки
+            is_retryable = (
+                "500" in str(e) or 
+                "internal error" in str(e).lower() or
+                "InternalServerError" in str(e) or
+                "ServiceUnavailable" in str(e) or
+                "TooManyRequests" in str(e) or
+                "DeadlineExceeded" in str(e)
+            )
+            
+            if is_retryable:
                 retries += 1
                 wait_time = 5 * (2 ** (retries - 1))
-                logger.warning(f"[USER_ID: {user_id}] - Server error. Retrying in {wait_time}s...")
+                logger.warning(f"[USER_ID: {user_id}] - Server error ({e}). Retrying in {wait_time}s...")
                 await asyncio.sleep(wait_time)
             else:
+                logger.error(f"[USER_ID: {user_id}] - Non-retryable error: {e}")
                 raise e
+    
+    logger.error(f"[USER_ID: {user_id}] - All {MAX_RETRIES} retry attempts failed")
     raise last_exception
 
 def convert_file_sharing_url(url: str) -> str:
@@ -244,6 +272,241 @@ def is_valid_file_url(text: str) -> bool:
     
     return 'dropbox.com' in text.lower()
 
+# --- Google Cloud Storage функции ---
+
+def prepare_telegram_image(page, user_id: int) -> io.BytesIO:
+    """
+    Подготавливает изображение страницы для отправки в Telegram
+    с правильными размерами (10x10 - 10000x10000 пикселей)
+    """
+    # Создаем изображение с базовым DPI
+    pix = page.get_pixmap(dpi=200)
+    
+    # Проверяем размеры и корректируем для соответствия требованиям Telegram
+    max_attempts = 3
+    attempt = 0
+    
+    while attempt < max_attempts:
+        width, height = pix.width, pix.height
+        
+        if width < 10 or height < 10:
+            # Размеры слишком маленькие - увеличиваем DPI
+            new_dpi = min(600, int(200 * (20 / min(width, height))))
+            pix = page.get_pixmap(dpi=new_dpi)
+            logger.info(f"[USER_ID: {user_id}] - Image too small ({width}x{height}), increasing DPI to {new_dpi}")
+        elif width > 10000 or height > 10000:
+            # Размеры слишком большие - уменьшаем DPI
+            scale_factor = min(9999 / width, 9999 / height)
+            new_dpi = max(50, int(200 * scale_factor))
+            pix = page.get_pixmap(dpi=new_dpi)
+            logger.info(f"[USER_ID: {user_id}] - Image too large ({width}x{height}), reducing DPI to {new_dpi}")
+        else:
+            # Размеры в норме
+            break
+            
+        attempt += 1
+    
+    # Используем PIL для дополнительной проверки и оптимизации
+    png_bytes = pix.tobytes("png")
+    image = Image.open(io.BytesIO(png_bytes))
+    
+    # Проверяем финальные размеры и корректируем через PIL если нужно
+    if image.width > 10000 or image.height > 10000:
+        # Масштабируем через PIL
+        image.thumbnail((9999, 9999), Image.Resampling.LANCZOS)
+        logger.info(f"[USER_ID: {user_id}] - Final resize via PIL to {image.width}x{image.height}")
+    elif image.width < 10 or image.height < 10:
+        # Увеличиваем через PIL
+        scale = max(2, 15 / min(image.width, image.height))
+        new_size = (int(image.width * scale), int(image.height * scale))
+        image = image.resize(new_size, Image.Resampling.LANCZOS)
+        logger.info(f"[USER_ID: {user_id}] - Final upscale via PIL to {image.width}x{image.height}")
+    
+    img_buffer = io.BytesIO()
+    image.save(img_buffer, format='PNG', optimize=True)
+    img_buffer.seek(0)
+    
+    # Финальная проверка размеров
+    final_size_mb = len(img_buffer.getvalue()) / 1024 / 1024
+    logger.info(f"[USER_ID: {user_id}] - Final Telegram image: {image.width}x{image.height}, {final_size_mb:.1f}MB")
+    
+    # Telegram также имеет лимит по размеру файла ~10MB
+    if final_size_mb > 10:
+        logger.warning(f"[USER_ID: {user_id}] - Image too large for Telegram ({final_size_mb:.1f}MB), compressing...")
+        img_buffer = io.BytesIO()
+        # Уменьшаем качество для больших изображений
+        image.save(img_buffer, format='JPEG', quality=70, optimize=True)
+        img_buffer.seek(0)
+        final_size_mb = len(img_buffer.getvalue()) / 1024 / 1024
+        logger.info(f"[USER_ID: {user_id}] - Compressed to JPEG: {final_size_mb:.1f}MB")
+    
+    return img_buffer
+
+def clean_filename(filename: str) -> str:
+    """Очищает имя файла для использования в GCS"""
+    if not filename:
+        return "unknown"
+    
+    # Убираем расширение
+    name = os.path.splitext(filename)[0]
+    # Заменяем пробелы на подчеркивания
+    name = name.replace(" ", "_")
+    # Оставляем только алфавит, цифры и подчеркивания
+    name = re.sub(r'[^a-zA-Zа-яёА-ЯЁ0-9_]', '', name)
+    
+    return name or "unknown"
+
+def format_utc_timestamp() -> str:
+    """Форматирует текущее время в UTC для имени папки"""
+    now = datetime.now(timezone.utc)
+    # Формат: 2025-08-02T14-30-45Z (двоеточия заменены на дефисы)
+    return now.strftime("%Y-%m-%dT%H-%M-%SZ")
+
+async def save_to_gcs(
+    user_id: int,
+    pdf_name: str,
+    page_image_bytes: bytes,
+    ocr_html: str,
+    corrected_json: dict,
+    find_prompt: str,
+    extract_prompt: str
+) -> bool:
+    """
+    Сохраняет все данные в Google Cloud Storage или локально для тестирования
+    """
+    if not GCS_BUCKET:
+        logger.warning("GCS_BUCKET not configured, skipping archive")
+        return False
+    
+    try:
+        # Инициализируем клиент GCS
+        client = storage.Client()
+        bucket = client.bucket(GCS_BUCKET)
+        
+        # Формируем базовый путь
+        timestamp = format_utc_timestamp()
+        clean_pdf_name = clean_filename(pdf_name)
+        base_path = f"user_{user_id}/{clean_pdf_name}_{timestamp}"
+        
+        logger.info(f"[USER_ID: {user_id}] - Saving to GCS: {base_path}")
+        
+        # 1. Сохраняем input.webp (конвертируем в WebP lossless)
+        webp_buffer = io.BytesIO()
+        image = Image.open(io.BytesIO(page_image_bytes))
+        image.save(webp_buffer, format='WEBP', lossless=True)
+        webp_bytes = webp_buffer.getvalue()
+        
+        blob = bucket.blob(f"{base_path}/input.webp")
+        blob.upload_from_string(webp_bytes, content_type='image/webp')
+        
+        # 2. Сохраняем ocr_raw.html.gz
+        html_gzipped = gzip.compress(ocr_html.encode('utf-8'))
+        blob = bucket.blob(f"{base_path}/ocr_raw.html.gz")
+        blob.upload_from_string(html_gzipped, content_type='application/gzip')
+        
+        # 3. Сохраняем corrected.json
+        json_data = json.dumps(corrected_json, ensure_ascii=False, indent=2)
+        blob = bucket.blob(f"{base_path}/corrected.json")
+        blob.upload_from_string(json_data, content_type='application/json')
+        
+        # 4. Сохраняем find_prompt.txt (промпт для поиска таблиц)
+        blob = bucket.blob(f"{base_path}/find_prompt.txt")
+        blob.upload_from_string(find_prompt, content_type='text/plain')
+        
+        # 5. Сохраняем extract_prompt.txt (промпт для извлечения данных)
+        blob = bucket.blob(f"{base_path}/extract_prompt.txt")
+        blob.upload_from_string(extract_prompt, content_type='text/plain')
+        
+        # 6. Сохраняем meta.json
+        meta_data = {
+            "user_id": user_id,
+            "pdf_name": pdf_name,
+            "clean_pdf_name": clean_pdf_name,
+            "timestamp": timestamp,
+            "timestamp_iso": datetime.now(timezone.utc).isoformat(),
+            "find_prompt_length": len(find_prompt),
+            "extract_prompt_length": len(extract_prompt),
+            "processing_id": str(uuid.uuid4())
+        }
+        meta_json = json.dumps(meta_data, ensure_ascii=False, indent=2)
+        blob = bucket.blob(f"{base_path}/meta.json")
+        blob.upload_from_string(meta_json, content_type='application/json')
+        
+        logger.info(f"[USER_ID: {user_id}] - Successfully saved to GCS: {base_path}")
+        
+        # Добавляем в суточный Parquet (async task)
+        asyncio.create_task(add_to_daily_parquet(
+            user_id, clean_pdf_name, webp_bytes, ocr_html, corrected_json, find_prompt, extract_prompt
+        ))
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"[USER_ID: {user_id}] - Failed to save to GCS: {e}", exc_info=True)
+        return False
+
+async def add_to_daily_parquet(
+    user_id: int,
+    pdf_name: str, 
+    webp_bytes: bytes,
+    ocr_html: str,
+    corrected_json: dict,
+    find_prompt: str,
+    extract_prompt: str
+):
+    """
+    Добавляет запись в суточный Parquet файл
+    """
+    if not GCS_BUCKET:
+        return
+        
+    try:
+        client = storage.Client()
+        bucket = client.bucket(GCS_BUCKET)
+        
+        # Формируем имя файла для сегодня
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        parquet_path = f"dataset/{today}.parquet"
+        
+        # Создаем новую запись
+        new_record = {
+            "png_webp": [webp_bytes],
+            "ocr_html": [ocr_html],
+            "corrected": [json.dumps(corrected_json, ensure_ascii=False)],
+            "find_prompt": [find_prompt],
+            "extract_prompt": [extract_prompt],
+            "user_id": [user_id],
+            "pdf_name": [pdf_name],
+            "ts": [datetime.now(timezone.utc)]
+        }
+        
+        new_df = pd.DataFrame(new_record)
+        
+        # Проверяем, существует ли уже файл
+        blob = bucket.blob(parquet_path)
+        
+        if blob.exists():
+            # Читаем существующий файл
+            existing_data = blob.download_as_bytes()
+            existing_df = pd.read_parquet(io.BytesIO(existing_data))
+            
+            # Объединяем данные
+            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+        else:
+            combined_df = new_df
+        
+        # Сохраняем обратно
+        parquet_buffer = io.BytesIO()
+        combined_df.to_parquet(parquet_buffer, compression='zstd', index=False)
+        parquet_buffer.seek(0)
+        
+        blob.upload_from_file(parquet_buffer, content_type='application/octet-stream')
+        
+        logger.info(f"[USER_ID: {user_id}] - Added to daily parquet: {parquet_path}")
+        
+    except Exception as e:
+        logger.error(f"[USER_ID: {user_id}] - Failed to add to parquet: {e}", exc_info=True)
+
 # --- Основная логика --- 
 
 async def process_specification(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -256,9 +519,35 @@ async def process_specification(update: Update, context: ContextTypes.DEFAULT_TY
         # Этап 2: Извлечение страницы в PNG и распознавание с Azure
         logger.info(f"[USER_ID: {user_id}] - STEP 2: Extracting page {page_number} to PNG and sending to Azure...")
         pdf_document = fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf")
+        
+        # Проверяем, что страница существует
+        if page_number > len(pdf_document):
+            pdf_document.close()
+            await chat.send_message(f"Ошибка: страница {page_number} не существует. Документ содержит только {len(pdf_document)} страниц.")
+            return
+        
         page_to_ocr = pdf_document.load_page(page_number - 1)
-        pix = page_to_ocr.get_pixmap(dpi=300)
-        png_bytes = pix.tobytes("png")
+        
+        # Начинаем с DPI 300, но уменьшаем если файл слишком большой
+        dpi = 300
+        max_file_size = 4 * 1024 * 1024  # 4MB лимит для Azure
+        
+        while dpi >= 150:
+            pix = page_to_ocr.get_pixmap(dpi=dpi)
+            png_bytes = pix.tobytes("png")
+            
+            if len(png_bytes) <= max_file_size:
+                logger.info(f"[USER_ID: {user_id}] - Using DPI {dpi}, image size: {len(png_bytes) / 1024 / 1024:.1f}MB")
+                break
+            else:
+                logger.warning(f"[USER_ID: {user_id}] - DPI {dpi} too large ({len(png_bytes) / 1024 / 1024:.1f}MB), reducing...")
+                dpi -= 50
+        
+        if len(png_bytes) > max_file_size:
+            pdf_document.close()
+            await chat.send_message("Ошибка: страница слишком большая для обработки. Попробуйте с другим документом.")
+            return
+            
         pdf_document.close()
 
         async with DocumentIntelligenceClient(endpoint=AZURE_ENDPOINT, credential=AzureKeyCredential(AZURE_KEY)) as client:
@@ -284,7 +573,13 @@ async def process_specification(update: Update, context: ContextTypes.DEFAULT_TY
         logger.info(f"[USER_ID: {user_id}] - STEP 3: Correcting and extracting JSON with Gemini...")
         prompt = get_prompt("extract_and_correct.txt")
         model = genai.GenerativeModel(model_name=GEMINI_MODEL_NAME)
-        response = await model.generate_content_async([prompt, full_html_content], generation_config=GenerationConfig(response_mime_type="application/json"))
+        response = await run_gemini_with_retry(
+            model, 
+            prompt, 
+            full_html_content, 
+            user_id, 
+            generation_config=GenerationConfig(response_mime_type="application/json")
+        )
         
         json_data = json.loads(response.text)
         logger.info(f"[USER_ID: {user_id}] - JSON extracted successfully.")
@@ -302,6 +597,34 @@ async def process_specification(update: Update, context: ContextTypes.DEFAULT_TY
         xlsx_buffer = io.BytesIO()
         df.to_excel(xlsx_buffer, index=False, engine='openpyxl')
         xlsx_buffer.seek(0)
+
+        # Этап 5: Сохранение в Google Cloud Storage для файнтюнинга
+        pdf_file_name = context.user_data.get("pdf_file_name", "unknown")
+        logger.info(f"[USER_ID: {user_id}] - STEP 5: Saving to GCS for fine-tuning...")
+        
+        # Получаем промпты из файлов
+        find_prompt = get_prompt("find_and_validate.txt")
+        extract_prompt = get_prompt("extract_and_correct.txt")
+        
+        # Создаем высококачественную версию для архивирования (DPI 300)
+        pdf_document = fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf")
+        page_for_archive = pdf_document.load_page(page_number - 1)
+        archive_pix = page_for_archive.get_pixmap(dpi=300)  # Всегда высокое качество для архива
+        archive_png_bytes = archive_pix.tobytes("png")
+        pdf_document.close()
+        
+        logger.info(f"[USER_ID: {user_id}] - Archive image: {len(archive_png_bytes) / 1024 / 1024:.1f}MB at 300 DPI")
+        
+        # Сохраняем данные в GCS с высококачественным изображением
+        await save_to_gcs(
+            user_id=user_id,
+            pdf_name=pdf_file_name,
+            page_image_bytes=archive_png_bytes,  # Используем архивную версию!
+            ocr_html=full_html_content,
+            corrected_json=json_data,
+            find_prompt=find_prompt,
+            extract_prompt=extract_prompt
+        )
 
         await chat.send_message("Ваша спецификация обработана:")
         await chat.send_document(document=InputFile(xlsx_buffer, filename="specification.xlsx"))
@@ -356,6 +679,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     file_id = update.message.document.file_id
     file_name = update.message.document.file_name
+    
+    # Сохраняем имя файла для использования в GCS
+    context.user_data["pdf_file_name"] = file_name
     
     await update.message.reply_text(f"Файл '{file_name}' принят. Начинаю загрузку...")
 
@@ -435,18 +761,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pdf_document = fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf")
         page = pdf_document.load_page(page_number - 1)
         
-        # Создаем изображение с правильными размерами для Telegram
-        pix = page.get_pixmap(dpi=200)
-        
-        # Проверяем размеры и корректируем если необходимо
-        if pix.width < 10 or pix.height < 10:
-            # Если размеры слишком маленькие, увеличиваем DPI
-            pix = page.get_pixmap(dpi=300)
-        elif pix.width > 10000 or pix.height > 10000:
-            # Если размеры слишком большие, уменьшаем DPI
-            pix = page.get_pixmap(dpi=150)
-        
-        img_buffer = io.BytesIO(pix.tobytes("png"))
+        # Подготавливаем изображение для Telegram
+        img_buffer = prepare_telegram_image(page, user_id)
         pdf_document.close()
 
         keyboard = [[InlineKeyboardButton("✅ Да", callback_data="yes"), InlineKeyboardButton("❌ Нет", callback_data="no")]]
@@ -526,6 +842,23 @@ async def handle_file_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     url = update.message.text.strip()
     
+    # Извлекаем имя файла из URL для Dropbox
+    file_name_from_url = "unknown"
+    try:
+        # Для Dropbox ссылок пытаемся извлечь имя файла из пути
+        import urllib.parse
+        parsed_url = urllib.parse.urlparse(url)
+        path_parts = parsed_url.path.split('/')
+        for part in path_parts:
+            if part.endswith('.pdf'):
+                file_name_from_url = part
+                break
+    except:
+        file_name_from_url = "dropbox_file.pdf"
+    
+    # Сохраняем имя файла для использования в GCS
+    context.user_data["pdf_file_name"] = file_name_from_url
+    
     # Проверяем валидность ссылки
     if not is_valid_file_url(url):
         supported_services = """❌ Поддерживается только Dropbox
@@ -595,18 +928,8 @@ async def handle_file_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pdf_document = fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf")
             page = pdf_document.load_page(page_number - 1)
             
-            # Создаем изображение с правильными размерами для Telegram
-            pix = page.get_pixmap(dpi=200)
-            
-            # Проверяем размеры и корректируем если необходимо
-            if pix.width < 10 or pix.height < 10:
-                # Если размеры слишком маленькие, увеличиваем DPI
-                pix = page.get_pixmap(dpi=300)
-            elif pix.width > 10000 or pix.height > 10000:
-                # Если размеры слишком большие, уменьшаем DPI
-                pix = page.get_pixmap(dpi=150)
-            
-            img_buffer = io.BytesIO(pix.tobytes("png"))
+            # Подготавливаем изображение для Telegram
+            img_buffer = prepare_telegram_image(page, user_id)
             pdf_document.close()
 
             keyboard = [[InlineKeyboardButton("✅ Да", callback_data="yes"), InlineKeyboardButton("❌ Нет", callback_data="no")]]
@@ -656,6 +979,9 @@ def main():
     if not all([TELEGRAM_BOT_TOKEN, AZURE_ENDPOINT, AZURE_KEY, GEMINI_API_KEY]):
         logger.critical("FATAL: One or more environment variables are missing!")
         return
+    
+    if not GCS_BUCKET:
+        logger.warning("GCS_BUCKET not configured - archiving will be disabled")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     conv_handler = ConversationHandler(

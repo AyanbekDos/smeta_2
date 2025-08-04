@@ -1,6 +1,9 @@
 # Переменные окружения
 .env
 
+# Google Cloud Service Account Key
+gcs-service-account.json
+
 # Python
 __pycache__/
 *.py[cod]
