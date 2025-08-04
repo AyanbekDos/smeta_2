@@ -1,34 +1,46 @@
-# Игнорируем архивные файлы
-archive_files/
-
-# Игнорируем Git файлы
+# Git
 .git/
 .gitignore
 
-# Игнорируем переменные окружения
-.env
-
-# Игнорируем Python cache
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .Python
+env/
+venv/
+.venv/
 
-# Игнорируем IDE файлы
+# Logs
+*.log
+bot.log
+
+# Local development files
+.env
+gcs-service-account.json
+
+# Temporary files
+temp_bot_files/
+archive_files/
+*.tmp
+
+# Development documentation  
+README.md
+DEPLOYMENT.md
+
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# Игнорируем Docker файлы
-.dockerignore
-Dockerfile
+# OS
+.DS_Store
+Thumbs.db
 
-# Игнорируем временные файлы
-temp_bot_files/
-*.tmp
-*.log
+# Claude specific
+.claude/
 
-# Игнорируем документацию разработки
-README.md
+# Test files
+test_*.py

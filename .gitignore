@@ -1,5 +1,8 @@
 # Переменные окружения
 .env
+.env.production
+.env.local
+.env.development
 
 # Google Cloud Service Account Key
 gcs-service-account.json
