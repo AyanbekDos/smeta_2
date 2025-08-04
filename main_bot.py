@@ -954,9 +954,13 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
+from telegram.request import HTTPXRequest
+
 def setup_bot() -> Application:
     """Создает и настраивает экземпляр PTB Application."""
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # Увеличиваем таймауты для сети
+    request = HTTPXRequest(timeout=30.0, connect_timeout=15.0, read_timeout=20.0)
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).request(request).build()
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
