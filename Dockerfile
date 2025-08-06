@@ -22,6 +22,5 @@ COPY . .
 # Создаем директорию для временных файлов
 RUN mkdir -p temp_bot_files
 
-# Запускаем Flask через gunicorn (WSGI)
-# Убираем uvicorn - он для ASGI, а Flask это WSGI
-CMD exec gunicorn --bind 0.0.0.0:$PORT --workers 1 --timeout 3600 main_bot:flask_app
+# Запускаем Telegram бота напрямую через Python
+CMD ["python", "main_bot.py"]
