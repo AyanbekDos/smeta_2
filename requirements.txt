@@ -10,5 +10,8 @@ PyMuPDF
 aiohttp
 httpx
 google-cloud-storage
+boto3
 pyarrow
 fastparquet
+google-cloud-aiplatform
+PyMuPDF
